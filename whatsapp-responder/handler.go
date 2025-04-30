@@ -2,74 +2,42 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"time"
+	"os"
+	"strings"
 )
 
-// Incoming dari wa.my.id
-type IncomingMessage struct {
-	Message string `json:"message"`
-	Number  string `json:"number"`
-}
-
-// Kirim pesan ke wa.my.id
-type SendMessageRequest struct {
-	ApiKey   string `json:"api_key"`
-	DeviceID string `json:"device_id"`
-	Number   string `json:"number"`
-	Message  string `json:"message"`
-}
-
-// Ganti dengan API KEY kamu
-const (
-	apiKey   = ""
-	deviceID = ""
-)
-
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "POST" {
-		var msg IncomingMessage
-		err := json.NewDecoder(r.Body).Decode(&msg)
-		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("Pesan masuk dari %s: %s", msg.Number, msg.Message)
-
-		// Simpan pesan masuk ke MongoDB
-		saveMessage(msg.Number, msg.Message, "incoming")
-
-		// Logika auto-reply
-		var reply string
-		switch msg.Message {
-		case "halo":
-			reply = "Halo! Ada yang bisa dibantu? 😊"
-		case "siapa kamu?":
-			reply = "Saya adalah bot WhatsApp Golang!"
-		default:
-			reply = "Maaf, saya tidak paham pesanmu 😅"
-		}
-
-		// Simpan pesan keluar ke MongoDB
-		saveMessage(msg.Number, reply, "outgoing")
-
-		// Kirim balasan ke wa.my.id
-		go sendReply(msg.Number, reply)
-		fmt.Fprintln(w, "Pesan diterima")
+// Fungsi untuk menangani kata kunci dan memberikan balasan otomatis
+func handleKeywords(message string) string {
+	// Ambil kata kunci dari database
+	keywords, err := getKeywordsFromDB()
+	if err != nil {
+		log.Println("Gagal mengambil kata kunci dari database:", err)
+		return "Maaf, ada kesalahan dalam sistem 😅"
 	}
+
+	// Cek pesan dan beri balasan sesuai kata kunci yang ada di database
+	for _, keyword := range keywords {
+		if strings.ToLower(message) == strings.ToLower(keyword.Keyword) {
+			return keyword.Reply
+		}
+	}
+
+	// Jika tidak ada kecocokan, balas pesan default
+	return "Maaf, saya tidak paham pesanmu 😅"
 }
 
-func sendReply(number string, message string) {
-	payload := SendMessageRequest{
-		ApiKey:   apiKey,
-		DeviceID: deviceID,
-		Number:   number,
-		Message:  message,
+// Fungsi untuk mengirim balasan menggunakan wa.my.id API
+func sendReply(number, message string) {
+	// Format payload untuk kirim ke wa.my.id API
+	payload := map[string]string{
+		"api_key":   os.Getenv("WAPI_KEY"),
+		"device_id": os.Getenv("DEVICE_ID"),
+		"number":    number,
+		"message":   message,
 	}
 
 	payloadBytes, _ := json.Marshal(payload)
@@ -82,19 +50,35 @@ func sendReply(number string, message string) {
 	log.Printf("Balasan terkirim ke %s", number)
 }
 
-func saveMessage(number, message, direction string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// Fungsi untuk menangani webhook
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+	// Ambil Secret Code dari environment
+	expectedSecret := os.Getenv("WEBHOOKSECRET")
+	secretCode := r.Header.Get("X-Secret-Code")
 
-	newMessage := Message{
-		Number:    number,
-		Message:   message,
-		Direction: direction,
-		Timestamp: time.Now().Unix(),
+	// Validasi Secret Code
+	if secretCode != expectedSecret {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
-	_, err := MessageCollection.InsertOne(ctx, newMessage)
+	// Pesan masuk yang diterima
+	var msg IncomingMessage
+	err := json.NewDecoder(r.Body).Decode(&msg)
 	if err != nil {
-		log.Printf("Gagal menyimpan pesan: %v", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
 	}
+
+	// Menyimpan pesan ke MongoDB dan mengirim balasan
+	log.Printf("Pesan dari %s: %s", msg.Number, msg.Message)
+
+	// Proses untuk memberikan balasan otomatis berdasarkan kata kunci
+	reply := handleKeywords(msg.Message)
+
+	// Kirim balasan menggunakan wa.my.id API
+	go sendReply(msg.Number, reply)
+
+	// Berikan respon 200 OK
+	fmt.Fprintln(w, "Pesan diterima")
 }
